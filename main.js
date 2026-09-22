@@ -1445,6 +1445,54 @@ class Parcel extends utils.Adapter {
       native: {},
     });
   }
+  async request17TApi(command, data) {
+    // Stay below the API limit of three requests per second.
+    await this.sleep(350);
+    const res = await this.requestClient({
+      method: 'post',
+      url: 'https://api.17track.net/track/v1/' + command,
+      headers: {
+        '17token': this.config['17trackKey'],
+        'Content-Type': 'application/json',
+      },
+      data: JSON.stringify(data),
+    });
+    const body = res.data;
+    if (!body || body.code !== 0 || !body.data || !Array.isArray(body.data.accepted)) {
+      throw new Error('17TRACK ' + command + ' failed: ' + JSON.stringify(body));
+    }
+    return body.data;
+  }
+  async refresh17TTrackList() {
+    const numbers = new Set();
+    const pages = new Set();
+    // A number filter here would replace the entire list with just that shipment.
+    for (let page = 1; ; page++) {
+      const data = await this.request17TApi('gettracklist', { page_no: page });
+      if (data.accepted.length === 0) break;
+      const pageKey = JSON.stringify(data.accepted);
+      if (pages.has(pageKey)) {
+        throw new Error('17TRACK gettracklist returned a repeated page');
+      }
+      pages.add(pageKey);
+      for (const track of data.accepted) numbers.add(track.number);
+    }
+    const trackList = Array.from(numbers);
+    await this.setStateAsync('17t.trackList', JSON.stringify(trackList), true);
+    return trackList;
+  }
+  async fetch17TParcels() {
+    const trackList = await this.refresh17TTrackList();
+    /** @type {{ accepted: any[], rejected: any[] }} */
+    const result = { accepted: [], rejected: [] };
+    // GetTrackInfo accepts at most 40 numbers per request. Merge before publishing.
+    for (let offset = 0; offset < trackList.length; offset += 40) {
+      const data = await this.request17TApi('gettrackinfo', trackList.slice(offset, offset + 40).map((number) => ({ number })));
+      result.accepted.push(...data.accepted);
+      result.rejected.push(...(data.rejected || []));
+    }
+    return result;
+  }
   async login17T(silent) {
     await this.requestClient({
       method: 'post',
@@ -1510,27 +1558,11 @@ class Parcel extends utils.Adapter {
   }
   async updateProvider() {
     this.log.debug('updateProvider started. Sessions: ' + JSON.stringify(Object.keys(this.sessions)));
-    let data17Track = {};
     let dataDhl = [];
     this.mergedJson = [];
     this.mergedJsonObject = {};
     this.inDelivery = [];
     this.notDelivered = [];
-    if (this.sessions['17track']) {
-      try {
-        const trackList = await this.getStateAsync('17t.trackList');
-        if (trackList && trackList.val) {
-          if (!trackList.val.map) {
-            trackList.val = JSON.parse(trackList.val);
-          }
-          data17Track = trackList.val.map((track) => {
-            return { number: track };
-          });
-        }
-      } catch (error) {
-        this.logAxiosError('17Track/user', error);
-      }
-    }
     if (this.sessions['dhl']) {
       // Remove stale Akamai bot-detection cookies that cause ECONNRESET/ETIMEDOUT
       for (const domain of ['dhl.de', 'www.dhl.de']) {
@@ -1604,14 +1636,8 @@ class Parcel extends utils.Adapter {
       ],
       '17track': [
         {
-          method: 'post',
+          custom: '17track',
           path: '17t.trackinginfo',
-          url: 'https://api.17track.net/track/v1/gettrackinfo',
-          header: {
-            '17token': this.config['17trackKey'],
-            'Content-Type': 'application/json',
-          },
-          data: JSON.stringify(data17Track),
         },
       ],
       '17tuser': [
@@ -1687,18 +1713,20 @@ class Parcel extends utils.Adapter {
         // Custom-Fetch: statt requestClient wird der Provider-eigene
         // Fetch aufgerufen, das Ergebnis läuft aber durch dieselbe .then()-Pipeline
         // (cleanupProvider → mergeProviderJson → json2iob.parse → setState).
-        const requestFn = element.custom === 'dpd'
-          ? async () => {
-            const data = await this.fetchDPDParcels();
-            return { data: data || null };
-          }
-          : () => this.requestClient({
-            method: element.method ? element.method : 'get',
-            url: element.url,
-            headers: element.header,
-            data: element.data,
-            timeout: element.url && element.url.includes('dhl.de') ? 15000 : undefined,
-          });
+        const requestFn = element.custom === '17track'
+          ? async () => ({ data: { data: await this.fetch17TParcels() } })
+          : element.custom === 'dpd'
+            ? async () => {
+              const data = await this.fetchDPDParcels();
+              return { data: data || null };
+            }
+            : () => this.requestClient({
+              method: element.method ? element.method : 'get',
+              url: element.url,
+              headers: element.header,
+              data: element.data,
+              timeout: element.url && element.url.includes('dhl.de') ? 15000 : undefined,
+            });
         if (!element.custom) {
           this.log.debug(element.url);
         }
@@ -1803,7 +1831,7 @@ class Parcel extends utils.Adapter {
             if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
               this.log.info(id + ' is not available. Maybe the service down or overloaded at the moment');
             } else {
-              this.log.error(element.url);
+              this.log.error(element.url || element.path);
               this.logAxiosError('Update/fetch', error);
               error.response && this.log.error(JSON.stringify(error.response.data));
             }
@@ -2043,7 +2071,7 @@ class Parcel extends utils.Adapter {
           status: sendung.track.z0 ? sendung.track.z0.z : '',
           source: '17track',
         };
-        if (!this.mergedJsonObject[sendung.id]) {
+        if (!this.mergedJsonObject[sendung.number]) {
           sendungsObject.delivery_status = this.deliveryStatusCheck(sendung, id, sendungsObject);
           if (sendungsObject.delivery_status === this.delivery_status.OUT_FOR_DELIVERY) {
             sendungsObject.inDelivery = true;
@@ -2052,7 +2080,7 @@ class Parcel extends utils.Adapter {
           if (sendungsObject.delivery_status !== this.delivery_status.DELIVERED) {
             this.notDelivered.push(sendungsObject);
           }
-          this.mergedJsonObject[sendung.id] = sendungsObject;
+          this.mergedJsonObject[sendung.number] = sendungsObject;
         }
         return sendungsObject;
       });
@@ -2836,34 +2864,7 @@ class Parcel extends utils.Adapter {
           })
             .then(async (res) => {
               this.log.debug(JSON.stringify(res.data));
-              await this.requestClient({
-                method: 'post',
-                url: 'https://api.17track.net/track/v1/gettracklist',
-                headers: {
-                  '17token': this.config['17trackKey'],
-                  'Content-Type': 'application/json',
-                },
-                data: {
-                  number: state.val,
-                  auto_detection: true,
-                },
-              })
-                .then(async (res) => {
-                  this.log.debug(JSON.stringify(res.data));
-                  if (res.data && res.data.data && res.data.data.accepted) {
-                    const trackArray = [];
-                    for (const track of res.data.data.accepted) {
-                      trackArray.push(track.number);
-                    }
-                    this.setState('17t.trackList', JSON.stringify(trackArray), true);
-                  }
-                })
-                .catch((error) => {
-                  this.logAxiosError('17Track/track', error);
-                  if (error.response) {
-                    this.log.error(JSON.stringify(error.response.data));
-                  }
-                });
+              await this.refresh17TTrackList();
             })
             .catch((error) => {
               this.logAxiosError('17Track/track', error);
