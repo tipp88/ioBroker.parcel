@@ -1461,7 +1461,7 @@ class Parcel extends utils.Adapter {
     if (!body || body.code !== 0 || !body.data || !Array.isArray(body.data.accepted)) {
       throw new Error('17TRACK ' + command + ' failed: ' + JSON.stringify(body));
     }
-    return body.data;
+    return { ...body.data, page: body.page };
   }
   async refresh17TTrackList() {
     const numbers = new Set();
@@ -1470,12 +1470,17 @@ class Parcel extends utils.Adapter {
     for (let page = 1; ; page++) {
       const data = await this.request17TApi('gettracklist', { page_no: page });
       if (data.accepted.length === 0) break;
-      const pageKey = JSON.stringify(data.accepted);
+      // Compare shipment identities, not mutable status fields or response order.
+      const pageKey = JSON.stringify(data.accepted.map((track) =>
+        JSON.stringify([track.number, track.w1 || track.carrier || 0])).sort());
       if (pages.has(pageKey)) {
-        throw new Error('17TRACK gettracklist returned a repeated page');
+        // Some responses repeat the last page instead of returning an empty one.
+        this.log.debug('17TRACK gettracklist repeated a page; using the collected shipments');
+        break;
       }
       pages.add(pageKey);
       for (const track of data.accepted) numbers.add(track.number);
+      if (Number.isInteger(data.page?.page_total) && page >= data.page.page_total) break;
     }
     const trackList = Array.from(numbers);
     await this.setStateAsync('17t.trackList', JSON.stringify(trackList), true);

@@ -93,10 +93,38 @@ describe('17TRACK API shipments', () => {
     assert.equal(states['17t.trackList'], '["LAST"]');
   });
 
-  it('rejects repeated pages instead of looping forever', async () => {
-    const { adapter, states } = fixture(() => response([{ number: 'FIRST' }]));
-    await assert.rejects(adapter.refresh17TTrackList(), /repeated page/);
-    assert.equal(states['17t.trackList'], '["LAST"]');
+  it('publishes all collected shipments when the API repeats its last page', async () => {
+    const { adapter, states, calls } = fixture((command, data) => {
+      if (command === 'gettracklist') {
+        return response(data.page_no === 1 ? [{ number: 'FIRST' }] : [{ number: 'SECOND' }]);
+      }
+      return response(data.map(({ number }) => ({ number, track: { z0: { z: 'In transit' } } })));
+    });
+    await adapter.updateProvider();
+    assert.deepEqual(JSON.parse(states['17t.trackList']), ['FIRST', 'SECOND']);
+    assert.deepEqual(Object.keys(JSON.parse(states.allProviderObjects)), ['FIRST', 'SECOND']);
+    assert.equal(states.notDeliveredCount, 2);
+    assert.equal(calls.filter((call) => call.command === 'gettracklist').length, 3);
+  });
+
+  it('recognizes repeated shipments despite changed metadata and response order', async () => {
+    const { adapter, calls } = fixture((_command, data) => response(data.page_no === 1
+      ? [{ number: 'FIRST', w1: 1, tt: 'old' }, { number: 'SECOND', w1: 2 }]
+      : [{ number: 'SECOND', w1: 2 }, { number: 'FIRST', w1: 1, tt: 'new' }]));
+    assert.deepEqual(plain(await adapter.refresh17TTrackList()), ['FIRST', 'SECOND']);
+    assert.equal(calls.length, 2);
+  });
+
+  it('stops at the reported last page without requesting an extra page', async () => {
+    const { adapter, calls } = fixture((_command, data) => ({
+      ...response([{ number: 'TRACK' + data.page_no }]),
+      data: {
+        ...response([{ number: 'TRACK' + data.page_no }]).data,
+        page: { page_no: data.page_no, page_total: 2 },
+      },
+    }));
+    assert.deepEqual(plain(await adapter.refresh17TTrackList()), ['TRACK1', 'TRACK2']);
+    assert.equal(calls.length, 2);
   });
 
   it('combines accepted and rejected results across detail batches', async () => {
