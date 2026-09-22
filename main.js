@@ -2848,35 +2848,46 @@ class Parcel extends utils.Adapter {
           return;
         }
         if (id.split('.')[2] === '17t') {
+          const command = id.split('.')[3];
+          if (command !== 'register' && command !== 'deleteTrack') return;
           if (!this.config['17trackKey']) {
             this.log.error('Missing 17Track Security Key');
             return;
           }
-          const command = id.split('.')[3];
-          await this.requestClient({
-            method: 'post',
-            url: 'https://api.17track.net/track/v1/' + command,
-            headers: {
-              '17token': this.config['17trackKey'],
-              'Content-Type': 'application/json',
-            },
-            data: JSON.stringify([
-              {
-                number: state.val,
-                auto_detection: true,
-              },
-            ]),
-          })
-            .then(async (res) => {
-              this.log.debug(JSON.stringify(res.data));
-              await this.refresh17TTrackList();
-            })
-            .catch((error) => {
-              this.logAxiosError('17Track/track', error);
-              if (error.response) {
-                this.log.error(JSON.stringify(error.response.data));
+          if ((typeof state.val !== 'string' && typeof state.val !== 'number') ||
+              (typeof state.val === 'number' && !Number.isSafeInteger(state.val))) {
+            this.log.error('17TRACK ' + command + ': enter the tracking number as text to preserve all digits');
+            return;
+          }
+          const number = String(state.val).trim();
+          if (!number) {
+            this.log.error('17TRACK ' + command + ': tracking number is empty');
+            return;
+          }
+          this.log.info('17TRACK ' + command + ': sending tracking number ' + number);
+          try {
+            const data = await this.request17TApi(command, [{ number, auto_detection: true }]);
+            for (const rejected of data.rejected || []) {
+              const error = rejected.error || {};
+              this.log.error('17TRACK ' + command + ' rejected ' + (rejected.number || number) +
+                ': ' + (error.code ?? 'unknown') + ' - ' + (error.message || JSON.stringify(rejected)));
+            }
+            if (!data.accepted.some((track) => track.number === number)) {
+              if (!data.rejected || data.rejected.length === 0) {
+                this.log.error('17TRACK ' + command + ': API did not accept tracking number ' + number);
               }
-            });
+              return;
+            }
+            this.log.info('17TRACK ' + command + ': accepted tracking number ' + number);
+            await this.setStateAsync(id, state.val, true);
+            await this.refresh17TTrackList();
+          } catch (error) {
+            this.logAxiosError('17Track/' + command, error);
+            if (error.response) {
+              this.log.error(JSON.stringify(error.response.data));
+            }
+          }
+          return;
         }
         if (id.split('.')[2] === '17tuser') {
           await this.requestClient({

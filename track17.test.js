@@ -79,6 +79,63 @@ describe('17TRACK API shipments', () => {
     });
   }
 
+  it('normalizes a registration, reports acceptance and acknowledges it', async () => {
+    const { adapter, states, calls } = fixture((command, data) => command === 'register'
+      ? response([{ number: data[0].number }]) : response([]));
+    const messages = [];
+    const writes = [];
+    const setState = adapter.setStateAsync;
+    adapter.setStateAsync = async (...args) => {
+      writes.push(args);
+      return setState(...args);
+    };
+    adapter.log.info = (message) => messages.push(message);
+    await adapter.onStateChange('parcel.0.17t.register', { val: '  00123456789  ', ack: false });
+    assert.deepEqual(calls[0], { command: 'register', data: [{ number: '00123456789', auto_detection: true }] });
+    assert.equal(states['parcel.0.17t.register'], '  00123456789  ');
+    assert.deepEqual(writes[0], ['parcel.0.17t.register', '  00123456789  ', true]);
+    assert.ok(messages.some((message) => message.includes('accepted tracking number 00123456789')));
+  });
+
+  it('reports API rejections returned with HTTP success without acknowledging success', async () => {
+    const { adapter, states, calls } = fixture(() => response([], [{
+      number: 'NEWTRACK', error: { code: -18019903, message: 'Carrier cannot be detected.' },
+    }]));
+    const errors = [];
+    adapter.log.error = (message) => errors.push(message);
+    await adapter.onStateChange('parcel.0.17t.register', { val: 'NEWTRACK', ack: false });
+    assert.ok(errors.some((message) => message.includes('-18019903') && message.includes('Carrier cannot be detected.')));
+    assert.equal(states['parcel.0.17t.register'], undefined);
+    assert.equal(calls.length, 1);
+  });
+
+  it('reports a nonzero API result even when HTTP succeeds', async () => {
+    const { adapter, states } = fixture(() => ({ data: { code: -18010002, data: {} } }));
+    const errors = [];
+    adapter.logAxiosError = (_label, error) => errors.push(error.message);
+    await adapter.onStateChange('parcel.0.17t.register', { val: 'NEWTRACK', ack: false });
+    assert.ok(errors.some((message) => message.includes('-18010002')));
+    assert.equal(states['parcel.0.17t.register'], undefined);
+  });
+
+  it('does not send acknowledged states or unrelated 17TRACK states as commands', async () => {
+    const { adapter, calls } = fixture(() => response([]));
+    await adapter.onStateChange('parcel.0.17t.register', { val: 'NEWTRACK', ack: true });
+    await adapter.onStateChange('parcel.0.17t.trackList', { val: '[]', ack: false });
+    assert.equal(calls.length, 0);
+  });
+
+  it('rejects empty or imprecise numeric input before making a request', async () => {
+    const { adapter, calls } = fixture(() => response([]));
+    const errors = [];
+    adapter.log.error = (message) => errors.push(message);
+    for (const val of ['  ', Number.MAX_SAFE_INTEGER + 1, null, true]) {
+      await adapter.onStateChange('parcel.0.17t.register', { val, ack: false });
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(errors.length, 4);
+  });
+
   it('clears an empty account without sending an empty gettrackinfo request', async () => {
     const { adapter, states, calls } = fixture(() => response([]));
     assert.deepEqual(plain(await adapter.fetch17TParcels()), { accepted: [], rejected: [] });
